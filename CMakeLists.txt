@@ -12,3 +12,4 @@ include(internal)
 include_directories(gaia ${ROOT_GEN_DIR}/gaia)
 
 add_subdirectory(gaia)
+add_subdirectory(mr)
