@@ -16,13 +16,19 @@ namespace bpo = boost::program_options;
 using std::string;
 
 
-future<> read_file_ex(file f) {
-  auto is = make_lw_shared<input_stream<char>>(make_file_input_stream(std::move(f)));
+future<> read_file_ex(file f, sstring fname) {
+  file* fptr = new file(std::move(f));
+
+  return fptr->dma_read<char>(0, 1 << 13).then([fptr] (temporary_buffer<char>) {
+     return fptr->close();
+   }).finally([guard = std::unique_ptr<file>(fptr)] {});
+
+  /* auto is = make_lw_shared<input_stream<char>>(make_file_input_stream(std::move(f)));
 
   return is->read().then([is] (temporary_buffer<char> buf) {
-      return is->close().finally([is] {});
-  });
-};
+      return is->close().finally([is] {});*/
+  // });
+}
 
 /*
   struct StreamConsumer {
@@ -54,7 +60,7 @@ class Mr {
     print("name %s\n", fname);
 
     return open_file_dma(full_name, open_flags::ro)
-      .then(&read_file_ex)
+      .then([full_name] (file f) { return read_file_ex(std::move(f), full_name); })
 
           /*return is.consume(StreamConsumer{this})
             .finally([&is] {
