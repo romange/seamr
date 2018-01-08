@@ -50,7 +50,6 @@ class DistributedMr final : public distributed<Mr> {
     return listing_->done();
   }
 
-
   ~DistributedMr() {
   }
 };
