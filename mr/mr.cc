@@ -17,9 +17,8 @@ class Mr {
 
  public:
   Mr() {
-    print("cpuid: %d\n", engine().cpu_id());
   }
-  future<> Process(sstring item) {
+  future<> Process(sstring& item) {
     print("file: %s\n", item);
     return make_ready_future<>();
   }
@@ -27,29 +26,34 @@ class Mr {
 };
 
 class DistributedMr final : public distributed<Mr> {
-  unsigned next_ = 0;
+  unsigned next_id_ = 0;
+  file dir_;
+
+  std::experimental::optional<subscription<directory_entry>> listing_;
+
+  future<> invoke(sstring fname) {
+    unsigned id = next_id_;
+    next_id_ = (next_id_ + 1) % smp::count;
+
+    return do_with(std::move(fname), [this, id](sstring& fname) {
+      return invoke_on(id, &Mr::Process, std::ref(fname));
+    });
+  }
 
  public:
-  future<> invoke(sstring fname) {
-    unsigned id = next_;
-    next_ = (next_ + 1) % smp::count;
-    print("invoke on : %d\n", id);
+  future<> register_for_dir(file dir) {
+    dir_ = std::move(dir);
 
-    return invoke_on(id, &Mr::Process, std::move(fname));
+    listing_.emplace(dir_.list_directory([this](directory_entry de) {
+       return invoke(de.name);
+    }));
+    return listing_->done();
+  }
+
+
+  ~DistributedMr() {
   }
 };
-
-future<> ListDir(file dir, DistributedMr* dmr) {
-  printf("Before listing\n");
-
-  auto listing = make_lw_shared<subscription<directory_entry>>(
-      dir.list_directory([dmr](directory_entry de) {
-       return dmr->invoke(de.name);
-    }));
-
-  return listing->done()
-    .finally([listing, dir = std::move(dir)] {});
-}
 
 future<int> AppRun(const bpo::variables_map& config) {
   sstring dir = config["dir"].as<std::string>();
@@ -61,12 +65,14 @@ future<int> AppRun(const bpo::variables_map& config) {
 
       auto mr = make_lw_shared<DistributedMr>();
 
-      return mr->start().then(
-          [ mr, dir = std::move(dir)] {
-            return ListDir(dir, mr.get());
+      auto res = mr->start().then(
+        [ mr, dir = std::move(dir)] {
+            return mr->register_for_dir(dir);
           })
-        .then([mr] { return mr->stop(); })
-        .then([] { return 0; });
+        .then([mr] {
+          return mr->stop(); })
+        .then([mr] { return 0; });
+      return res;
     } catch (std::exception& e) {
       std::cout << "exception2: " << e << "\n";
 
@@ -83,7 +89,7 @@ int main(int ac, char** av) {
                 ;
 
     return app.run(ac, av, [&app] {
-        print("=== Start High res clock test\n");
+        print("=== MR test\n");
         return AppRun(app.configuration());
     });
 }
