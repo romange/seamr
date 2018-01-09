@@ -16,58 +16,145 @@ namespace bpo = boost::program_options;
 using std::string;
 
 
-future<> read_file_ex(file f, sstring fname) {
-  file* fptr = new file(std::move(f));
+template<typename Container> temporary_buffer<char>
+  Flatten(const Container& c,
+          temporary_buffer<char> tail = temporary_buffer<char>()) {
+  if (c.empty())
+    return tail;
 
-  return fptr->dma_read<char>(0, 1 << 13).then([fptr] (temporary_buffer<char>) {
-     return fptr->close();
-   }).finally([guard = std::unique_ptr<file>(fptr)] {});
+  using tb_t = temporary_buffer<char>;
+  size_t total = std::accumulate(c.begin(), c.end(), 0,
+                                 [](size_t val, const tb_t& tb) { return val + tb.size();});
+  total += tail.size();
+  tb_t res(total);
+  char* dest = res.get_write();
+  for (const auto& src : c) {
+    dest = std::copy(src.begin(), src.end(), dest);
+  }
+  if (!tail.empty())
+    std::copy(tail.begin(), tail.end(), dest);
 
-  /* auto is = make_lw_shared<input_stream<char>>(make_file_input_stream(std::move(f)));
-
-  return is->read().then([is] (temporary_buffer<char> buf) {
-      return is->close().finally([is] {});*/
-  // });
+  return res;
 }
 
-/*
-  struct StreamConsumer {
-    using consumption_result_type = typename input_stream<char>::consumption_result_type;
+template<typename T> future<std::decay_t<T>> make_value_future(T&& val) {
+  return make_ready_future<std::decay_t<T>>(std::forward<T>(val));
+}
 
-    explicit StreamConsumer(Mr* mr) : mr_(mr) {}
+subscription<temporary_buffer<char>>
+emit_lines(input_stream<char> is, subscription<temporary_buffer<char>>::next_fn fn) {
+  using subscr_t = subscription<temporary_buffer<char>>;
+  using tmp_buf_t = temporary_buffer<char>;
 
+  class work {
+    std::vector<tmp_buf_t> pending_;
+    input_stream<char> is_;
    public:
-    future<consumption_result_type> operator()(temporary_buffer<char> buf) {
-      using stop_consuming_type = typename consumption_result_type::stop_consuming_type;
-      return make_ready_future<consumption_result_type>(stop_consuming_type({}));
-    }
+    work(input_stream<char> is) : is_(std::move(is)) {}
+
+    stream<temporary_buffer<char>> producer;
+
+    future<> emit_lines() {
+      return producer.started().then([this] {
+        return repeat([this] () {
+          return is_.read().then([this] (tmp_buf_t tmp) {
+            if (tmp.empty()) {
+              if (!pending_.empty()) {
+                tmp_buf_t line = Flatten(pending_);
+                pending_.clear();
+
+                return producer.produce(std::move(line)).then([] {
+                  return make_value_future(stop_iteration::yes);
+                });
+              }
+              return make_value_future(stop_iteration::yes);
+            }
+
+            return split_lines(std::move(tmp)).then([] () { return stop_iteration::no; });
+          });
+      }).finally([this] {
+        producer.close();
+        return is_.close();
+      });
+    });
+   }
+
    private:
-    Mr* mr_;
+    future<> split_lines(tmp_buf_t block) {
+      assert(!block.empty());
+
+      auto it = std::find(block.begin(), block.end(), '\n');
+      if (it == block.end()) {
+        pending_.push_back(std::move(block));
+        return make_ready_future<>();
+      }
+
+      size_t sz = 1 + (it - block.begin());
+      tmp_buf_t line = Flatten(pending_, block.share(0, sz));
+      pending_.clear();
+      block.trim_front(sz);
+      future<> f = producer.produce(std::move(line));
+
+      if (block.empty()) {
+        return f;
+      }
+
+      return f.then([this, block = std::move(block)] () mutable {
+                return split_lines(std::move(block)); }
+             );
+    }
+
   };
 
-*/
+  work* w = new work(std::move(is));
+  subscr_t res = w->producer.listen(std::move(fn));
+  w->emit_lines()
+    .handle_exception([] (std::exception_ptr e) {})
+    .finally([w] { delete w;});
+
+  return res;
+}
 
 class Mr {
   sstring dir_;
 
+  typedef temporary_buffer<char> tmp_buf_t;
+  unsigned lines_ = 0;
+
  public:
-
-
   Mr(sstring dir) : dir_(dir) {}
+
+  future<> EmitSingleLine(tmp_buf_t line) {
+    ++lines_;
+
+    return make_ready_future<>();
+  }
 
   future<> process(sstring& fname) {
     sstring full_name = dir_ + "/" + fname;
     print("name %s\n", fname);
 
     return open_file_dma(full_name, open_flags::ro)
-      .then([full_name] (file f) { return read_file_ex(std::move(f), full_name); })
+      .then([this] (file f) {
 
-          /*return is.consume(StreamConsumer{this})
-            .finally([&is] {
+        file_input_stream_options fo;
+        fo.buffer_size = 1 << 14;
+        fo.read_ahead = 1;
 
-             print("finally\n");
-             return is.close();
-           });*/
+        subscription<tmp_buf_t> subscr =
+            emit_lines(make_file_input_stream(std::move(f), fo),
+                       [this] (tmp_buf_t line) {
+                          return EmitSingleLine(std::move(line));
+                        });
+
+        return do_with(std::move(subscr), [this] (auto& subscr) {
+          return subscr.done().then([this] {
+              print("Counted %d lines\n", lines_);
+              lines_ = 0;
+            });
+          }
+        );
+      })
       .handle_exception([full_name] (std::exception_ptr eptr) {
         std::cerr << "Error: " << eptr << " for " << full_name << std::endl;
       });
@@ -75,9 +162,7 @@ class Mr {
 
   future<> stop() { return make_ready_future<>(); }
 
-
  private:
-
 };
 
 class DistributedMr final : public distributed<Mr> {
