@@ -15,6 +15,7 @@ using namespace std::chrono_literals;
 namespace bpo = boost::program_options;
 using std::string;
 
+bool stop_and_break = false;
 
 template<typename Container> temporary_buffer<char>
   Flatten(const Container& c,
@@ -49,13 +50,20 @@ emit_lines(input_stream<char> is, subscription<temporary_buffer<char>>::next_fn 
   class work {
     std::vector<tmp_buf_t> pending_;
     input_stream<char> is_;
+    stream<temporary_buffer<char>> producer_;
+    unsigned lines_ = 0;
+
    public:
+    work(const work&) = delete;
+
     work(input_stream<char> is) : is_(std::move(is)) {}
 
-    stream<temporary_buffer<char>> producer;
+    subscr_t listen(subscr_t::next_fn fn) {
+      return producer_.listen(std::move(fn));
+    }
 
     future<> emit_lines() {
-      return producer.started().then([this] {
+      return producer_.started().then([this] {
         return repeat([this] () {
           return is_.read().then([this] (tmp_buf_t tmp) {
             if (tmp.empty()) {
@@ -63,7 +71,7 @@ emit_lines(input_stream<char> is, subscription<temporary_buffer<char>>::next_fn 
                 tmp_buf_t line = Flatten(pending_);
                 pending_.clear();
 
-                return producer.produce(std::move(line)).then([] {
+                return producer_.produce(std::move(line)).then([] {
                   return make_value_future(stop_iteration::yes);
                 });
               }
@@ -72,10 +80,13 @@ emit_lines(input_stream<char> is, subscription<temporary_buffer<char>>::next_fn 
 
             return split_lines(std::move(tmp)).then([] () { return stop_iteration::no; });
           });
-      }).finally([this] {
-        producer.close();
+      }).then([this] {
+          producer_.close();
+        }).handle_exception([this] (std::exception_ptr e) {
+          producer_.set_exception(e);
+        });
+      }).then([this] {
         return is_.close();
-      });
     });
    }
 
@@ -93,7 +104,9 @@ emit_lines(input_stream<char> is, subscription<temporary_buffer<char>>::next_fn 
       tmp_buf_t line = Flatten(pending_, block.share(0, sz));
       pending_.clear();
       block.trim_front(sz);
-      future<> f = producer.produce(std::move(line));
+
+      ++lines_;
+      future<> f = producer_.produce(std::move(line));
 
       if (block.empty()) {
         return f;
@@ -107,10 +120,9 @@ emit_lines(input_stream<char> is, subscription<temporary_buffer<char>>::next_fn 
   };
 
   work* w = new work(std::move(is));
-  subscr_t res = w->producer.listen(std::move(fn));
-  w->emit_lines()
-    .handle_exception([] (std::exception_ptr e) {})
-    .finally([w] { delete w;});
+  subscr_t res = w->listen(std::move(fn));
+  w->emit_lines()  // never throws due to handle_exception inside.
+    .then([w] { delete w;});
 
   return res;
 }
@@ -153,8 +165,8 @@ class Mr {
               lines_ = 0;
             });
           }
-        );
-      })
+        );  // do_with
+      }) // open_file_dma
       .handle_exception([full_name] (std::exception_ptr eptr) {
         std::cerr << "Error: " << eptr << " for " << full_name << std::endl;
       });
@@ -187,7 +199,7 @@ class DistributedMr final : public distributed<Mr> {
     dir_fd_ = std::move(dir_fd);
 
     listing_.emplace(dir_fd_.list_directory([this](directory_entry de) {
-      if (de.type == directory_entry_type::regular)
+      if (!stop_and_break && de.type == directory_entry_type::regular)
         return invoke(de.name);
       else
         return make_ready_future<>();
@@ -202,6 +214,11 @@ class DistributedMr final : public distributed<Mr> {
 future<int> AppRun(const bpo::variables_map& config) {
   sstring dir = config["dir"].as<std::string>();
   print("%s\n", dir);
+
+  engine().at_exit([] {
+    stop_and_break = true;
+    return make_ready_future<>();
+  });
 
   return engine().open_directory(dir).then_wrapped([dir](future<file>&& ff) {
     try {
