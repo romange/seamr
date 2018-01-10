@@ -5,6 +5,7 @@
 #include <core/app-template.hh>
 #include <core/do_with.hh>
 #include <core/fstream.hh>
+#include <core/gate.hh>
 #include <core/reactor.hh>
 #include <core/print.hh>
 #include <core/sleep.hh>
@@ -133,20 +134,11 @@ class Mr {
   typedef temporary_buffer<char> tmp_buf_t;
   unsigned lines_ = 0;
 
- public:
-  Mr(sstring dir) : dir_(dir) {}
+  gate g_;
+  semaphore open_limit_{10};
 
-  future<> EmitSingleLine(tmp_buf_t line) {
-    ++lines_;
-
-    return make_ready_future<>();
-  }
-
-  future<> process(sstring& fname) {
-    sstring full_name = dir_ + "/" + fname;
-    print("name %s\n", fname);
-
-    return open_file_dma(full_name, open_flags::ro)
+  future<> process_file(sstring fname) {
+    return open_file_dma(fname, open_flags::ro)
       .then([this] (file f) {
 
         file_input_stream_options fo;
@@ -167,12 +159,35 @@ class Mr {
           }
         );  // do_with
       }) // open_file_dma
-      .handle_exception([full_name] (std::exception_ptr eptr) {
-        std::cerr << "Error: " << eptr << " for " << full_name << std::endl;
+      .handle_exception([fname] (std::exception_ptr eptr) {
+        std::cerr << "Error: " << eptr << " for " << fname << std::endl;
+      });
+  };
+
+ public:
+  Mr(sstring dir) : dir_(dir) {}
+
+  future<> EmitSingleLine(tmp_buf_t line) {
+    ++lines_;
+
+    return make_ready_future<>();
+  }
+
+  future<> process(sstring& fname) {
+    g_.enter();
+    sstring full_name = dir_ + "/" + fname;
+    return open_limit_.wait().then([this, full_name = std::move(full_name)] {
+        if (stop_and_break)
+          return make_ready_future<>();
+        print("name %s %d\n", full_name, engine().cpu_id());
+        return process_file(full_name);
+      }).then([this] {
+        open_limit_.signal();
+        g_.leave();
       });
   }
 
-  future<> stop() { return make_ready_future<>(); }
+  future<> stop() { return g_.close(); }
 
  private:
 };
@@ -186,16 +201,19 @@ class DistributedMr final : public distributed<Mr> {
     unsigned id = next_id_;
     next_id_ = (next_id_ + 1) % smp::count;
 
-    return do_with(std::move(fname), [this, id](sstring& fname) {
-      //return local().process(fname);
+    do_with(std::move(fname), [this, id](sstring& fname) {
       return invoke_on(id, &Mr::process, std::ref(fname));
+    }).then_wrapped([] (future<>&& f) {
+      f.ignore_ready_future();
     });
+
+    return make_ready_future<>();
   }
 
  public:
   DistributedMr() {}
 
-  future<> register_for_dir(file dir_fd) {
+  future<> list_dir(file dir_fd) {
     dir_fd_ = std::move(dir_fd);
 
     listing_.emplace(dir_fd_.list_directory([this](directory_entry de) {
@@ -228,7 +246,7 @@ future<int> AppRun(const bpo::variables_map& config) {
 
       auto res = mr->start(dir).then(
         [ mr, dir_fd = std::move(dir_fd)] {
-            return mr->register_for_dir(dir_fd);
+            return mr->list_dir(dir_fd);
           })
         .then([mr] {
           return mr->stop(); })
