@@ -15,16 +15,17 @@ using namespace seastar;
 using namespace std::chrono_literals;
 namespace bpo = boost::program_options;
 using std::string;
+typedef temporary_buffer<char> tmp_buf_t;
 
 bool stop_and_break = false;
 
-template<typename Container> temporary_buffer<char>
+template<typename Container> tmp_buf_t
   Flatten(const Container& c,
-          temporary_buffer<char> tail = temporary_buffer<char>()) {
+          tmp_buf_t tail = tmp_buf_t()) {
   if (c.empty())
     return tail;
 
-  using tb_t = temporary_buffer<char>;
+  using tb_t = tmp_buf_t;
   size_t total = std::accumulate(c.begin(), c.end(), 0,
                                  [](size_t val, const tb_t& tb) { return val + tb.size();});
   total += tail.size();
@@ -43,15 +44,14 @@ template<typename T> future<std::decay_t<T>> make_value_future(T&& val) {
   return make_ready_future<std::decay_t<T>>(std::forward<T>(val));
 }
 
-subscription<temporary_buffer<char>>
-emit_lines(input_stream<char> is, subscription<temporary_buffer<char>>::next_fn fn) {
-  using subscr_t = subscription<temporary_buffer<char>>;
-  using tmp_buf_t = temporary_buffer<char>;
+subscription<tmp_buf_t>
+emit_lines(input_stream<char> is, subscription<tmp_buf_t>::next_fn fn) {
+  using subscr_t = subscription<tmp_buf_t>;
 
   class work {
     std::vector<tmp_buf_t> pending_;
     input_stream<char> is_;
-    stream<temporary_buffer<char>> producer_;
+    stream<tmp_buf_t> producer_;
     unsigned lines_ = 0;
 
    public:
@@ -131,7 +131,6 @@ emit_lines(input_stream<char> is, subscription<temporary_buffer<char>>::next_fn 
 class Mr {
   sstring dir_;
 
-  typedef temporary_buffer<char> tmp_buf_t;
   unsigned lines_ = 0;
 
   gate g_;
